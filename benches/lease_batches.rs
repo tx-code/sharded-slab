@@ -54,6 +54,7 @@ fn successful_batches(c: &mut Criterion) {
                         let mut batch = checkout(&pool, count, strategy).unwrap();
                         for value in &mut batch {
                             value.extend_from_slice(black_box(&[3u64; 64]));
+                            black_box(&**value);
                         }
                         black_box(batch.iter().map(|v| v.len()).sum::<usize>());
                         drop(batch);
@@ -101,7 +102,9 @@ fn remote_batches(c: &mut Criterion) {
         let (done, ack) = mpsc::channel();
         let worker = thread::spawn(move || {
             for batch in rx {
-                black_box(batch.iter().map(|v| v.len()).sum::<usize>());
+                for value in &batch {
+                    black_box(&**value);
+                }
                 drop(batch);
                 done.send(()).unwrap();
             }

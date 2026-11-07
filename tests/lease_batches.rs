@@ -210,13 +210,18 @@ fn rollback_clear_panic_is_not_converted_to_capacity_none() {
             }
         }
     }
-    let pool = Arc::new(Pool::<PanicsOnce>::new_with_config::<TwoSlots>());
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        checkout(&pool, 3, Strategy::Reserved)
-    }));
-    assert!(result.is_err());
-    assert_eq!(CLEARS.load(Ordering::SeqCst), 2);
-    assert!(checkout(&pool, 2, Strategy::Reserved).is_none());
-    // 只有成功清理的槽可再发，另一个仍隔离，不把panic当正常None。
-    assert!(checkout(&pool, 1, Strategy::Reserved).is_some());
+    for strategy in [Strategy::Collect, Strategy::Reserved].iter().copied() {
+        PANIC_ONCE.store(true, Ordering::SeqCst);
+        let before = CLEARS.load(Ordering::SeqCst);
+        let pool = Arc::new(Pool::<PanicsOnce>::new_with_config::<TwoSlots>());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            checkout(&pool, 3, strategy)
+        }));
+        assert!(result.is_err());
+        assert_eq!(CLEARS.load(Ordering::SeqCst), before + 2);
+        assert!(checkout(&pool, 2, strategy).is_none());
+        // 只有成功清理的槽可再发，另一个仍隔离，不把panic当正常None。
+        assert!(checkout(&pool, 1, strategy).is_some());
+        assert_eq!(CLEARS.load(Ordering::SeqCst), before + 4);
+    }
 }

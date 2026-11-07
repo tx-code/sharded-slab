@@ -13,6 +13,32 @@ impl crate::Config for TwoSlots {
 }
 
 #[test]
+fn batch_attempt_races_final_remote_reader() {
+    run_model("batch_attempt_races_final_remote_reader", || {
+        let pool = Arc::new(Pool::<Buffer>::new_with_config::<TwoSlots>());
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut value = pool.clone().lease_owned().unwrap();
+        value.data.push(53);
+        value.cleared = Some(count.clone());
+        let last = value.freeze();
+        let worker = thread::spawn(move || {
+            assert_eq!(last.data, [53]);
+            drop(last);
+        });
+        // 归还尚未到达时允许None；不能等待容量，也不能读到未清理的数据。
+        let attempted: Option<Vec<_>> = (0..2).map(|_| pool.clone().lease_owned()).collect();
+        if let Some(ref batch) = attempted {
+            assert!(batch.iter().all(|value| value.data.is_empty()));
+        }
+        drop(attempted);
+        worker.join().unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let recovered: Option<Vec<_>> = (0..2).map(|_| pool.clone().lease_owned()).collect();
+        assert_eq!(recovered.unwrap().len(), 2);
+    });
+}
+
+#[test]
 fn failed_batch_keeps_existing_reader_and_returns_partial_slots() {
     run_model(
         "failed_batch_keeps_existing_reader_and_returns_partial_slots",
