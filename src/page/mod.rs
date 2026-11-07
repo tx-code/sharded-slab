@@ -417,7 +417,7 @@ impl<C: cfg::Config> Eq for Addr<C> {}
 
 impl<C: cfg::Config> PartialOrd for Addr<C> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+        self.addr.partial_cmp(&other.addr)
     }
 }
 
