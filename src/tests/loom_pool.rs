@@ -9,6 +9,32 @@ use loom::{
 };
 use std::sync::Arc;
 
+#[test]
+fn reused_mutable_guard_excludes_clear_and_get() {
+    run_model("reused_mutable_guard_excludes_clear_and_get", || {
+        let pool = Arc::new(Pool::<String>::new());
+        let first = pool.create().unwrap();
+        let old_key = first.key();
+        drop(first);
+        assert!(pool.clear(old_key));
+        let mut reserved = pool.clone().create_owned().unwrap();
+        let key = reserved.key();
+        let other = pool.clone();
+        thread::spawn(move || {
+            assert!(!other.clear(key));
+            assert!(other.get(key).is_none());
+        })
+        .join()
+        .unwrap();
+        reserved.push_str("live");
+        let reader = reserved.downgrade();
+        assert!(pool.clear(key));
+        assert_eq!(&*reader, "live");
+        drop(reader);
+        assert!(pool.get(key).is_none());
+    });
+}
+
 #[derive(Default, Debug)]
 struct State {
     is_dropped: AtomicBool,

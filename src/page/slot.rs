@@ -231,7 +231,14 @@ where
     /// Mutates this slot.
     ///
     /// This method spins until no references to this slot are left, and calls the mutator
-    fn release_with<F, M, R>(&self, gen: Generation<C>, offset: usize, free: &F, mutator: M) -> R
+    fn release_with<F, M, R>(
+        &self,
+        gen: Generation<C>,
+        offset: usize,
+        free: &F,
+        owns_removal: bool,
+        mutator: M,
+    ) -> R
     where
         F: FreeList<C>,
         M: FnOnce(Option<&mut T>) -> R,
@@ -259,9 +266,20 @@ where
                 return mutator(None);
             }
 
+            // take不能接管初始化中的槽或另一个take已经取得的清理权。
+            // 最后reader或独占弃置路径则已拥有Removing状态的清理权。
+            if !advanced
+                && !owns_removal
+                && Lifecycle::<C>::from_packed(lifecycle) == Lifecycle::REMOVING
+            {
+                return mutator(None);
+            }
+
             match self.lifecycle.compare_exchange(
                 lifecycle,
-                LifecycleGen(next_gen).pack(lifecycle),
+                // 空闲槽必须保持Removing：清理完再借出时，不能留下Marked/refs=0，
+                // 否则clear会在初始化guard尚存时再次回收该槽。
+                LifecycleGen(next_gen).pack(Lifecycle::<C>::REMOVING.pack(lifecycle)),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -320,7 +338,7 @@ where
             refs,
         );
 
-        if refs.value != 0 {
+        if refs.value != 0 || Lifecycle::<C>::from_packed(lifecycle) != Lifecycle::REMOVING {
             test_println!("-> initialize while referenced! cancelling");
             return None;
         }
@@ -412,7 +430,7 @@ where
         offset: usize,
         free: &F,
     ) -> Option<T> {
-        self.release_with(gen, offset, free, |item| item.and_then(Option::take))
+        self.release_with(gen, offset, free, false, |item| item.and_then(Option::take))
     }
 }
 
@@ -480,7 +498,7 @@ where
     ) -> bool {
         // release_with will _always_ wait unitl it can release the slot or just return if the slot
         // has already been released.
-        self.release_with(gen, offset, free, |item| {
+        self.release_with(gen, offset, free, true, |item| {
             let cleared = item.map(|inner| Clear::clear(inner)).is_some();
             test_println!("-> cleared: {}", cleared);
             cleared

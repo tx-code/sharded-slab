@@ -841,7 +841,8 @@ where
 }
 unsafe impl<T, C> Sync for Pool<T, C>
 where
-    T: Sync + Clear + Default,
+    // create/clear会跨线程构造、独占访问和清理拥有值。
+    T: Send + Sync + Clear + Default,
     C: cfg::Config,
 {
 }
@@ -1172,7 +1173,8 @@ where
 
 unsafe impl<T, C> Send for OwnedRef<T, C>
 where
-    T: Sync + Clear + Default,
+    // guard及最后池Arc的清理责任随拥有者迁移。
+    T: Send + Sync + Clear + Default,
     C: cfg::Config,
 {
 }
@@ -1336,7 +1338,8 @@ where
 
 unsafe impl<T, C> Send for OwnedRefMut<T, C>
 where
-    T: Sync + Clear + Default,
+    // 独占guard能移出T，也能downgrade并与原线程的get共享T。
+    T: Send + Sync + Clear + Default,
     C: cfg::Config,
 {
 }

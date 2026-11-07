@@ -779,7 +779,8 @@ impl<T: fmt::Debug, C: cfg::Config> fmt::Debug for Slab<T, C> {
 }
 
 unsafe impl<T: Send, C: cfg::Config> Send for Slab<T, C> {}
-unsafe impl<T: Sync, C: cfg::Config> Sync for Slab<T, C> {}
+// 共享入口可插入、取走和析构拥有值，不只是读取&T。
+unsafe impl<T: Send + Sync, C: cfg::Config> Sync for Slab<T, C> {}
 
 // === impl Entry ===
 
@@ -847,7 +848,7 @@ where
 
 unsafe impl<T, C> Send for Entry<'_, T, C>
 where
-    T: Sync,
+    T: Send + Sync,
     C: cfg::Config,
 {
 }
@@ -1016,7 +1017,8 @@ where
 
 unsafe impl<T, C> Send for OwnedEntry<T, C>
 where
-    T: Sync,
+    // 最后guard可能清理T，最后Arc也可能在接收线程析构整个slab。
+    T: Send + Sync,
     C: cfg::Config,
 {
 }

@@ -29,6 +29,9 @@ struct Registry {
     free: Mutex<VecDeque<usize>>,
 }
 
+// 保留旧MSRV：usize关联MAX尚未稳定时也能表达同一个保留哨兵。
+const POISONED_ID: usize = !0;
+
 lazy_static! {
     static ref REGISTRY: Registry = Registry {
         next: AtomicUsize::new(0),
@@ -86,7 +89,7 @@ impl<C> Tid<C> {
     #[cold]
     fn poisoned() -> Self {
         Self {
-            id: std::usize::MAX,
+            id: POISONED_ID,
             _not_send: PhantomData,
             _cfg: PhantomData,
         }
@@ -94,7 +97,7 @@ impl<C> Tid<C> {
 
     /// Returns true if the local thread ID was accessed while unwinding.
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.id == std::usize::MAX
+        self.id == POISONED_ID
     }
 }
 
