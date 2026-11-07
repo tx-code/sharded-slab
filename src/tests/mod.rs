@@ -73,3 +73,6 @@ mod loom_pool;
 mod loom_slab;
 #[cfg(not(loom))]
 mod properties;
+
+#[cfg(loom)]
+mod page_publication;
