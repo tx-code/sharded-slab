@@ -235,6 +235,34 @@ drop(other);
 the last pool owner is released; leases do not provide a byte budget, page
 trimming, permanent identities, or application transaction rollback.
 
+### Managed idle payloads
+
+`pool::ManagedPool<T>` adds optional bounded idle payload retention on the same
+sharded pool/lease backend. `T: pool::Recyclable` reports dynamic bytes retained
+after `Clear`; `Vec<T>` and `String` are supported. `CacheLimits` bounds reported
+idle bytes, value count, and one value's report, not active allocations, cache
+metadata, backing slab pages, shared dependencies or RSS.
+
+`try_lease_owned()` distinguishes closed admission from backing-slot capacity.
+Admission linearizes under the controller lock; requests admitted before
+`close()` may finish lazy `Default` afterward and remain usable. Close drains
+idle payloads and rejects new admission; live exclusive/shared leases are not
+cleared. `trim()` removes then-idle payloads, and concurrent returns may refill
+the cache. Neither operation trims backing slab pages.
+
+Payload `Default`, `Clear`, byte reporting and destruction run outside cache
+locks. Returns may discard instead of caching on contention or limits; cache
+capacity is preallocated. Dropping the controller closes idle retention, while
+the leases use weak return routes and remain valid independently. Callback
+panic propagates; clear/report panic quarantines its backing slot until the
+pool is destroyed. The controller is shared with `Arc`, not cloned by value.
+
+Run `cargo bench --bench managed` for the optional policy's cold/warm, disabled
+retention, trim, close-with-reader, handoff and one/four-worker synthetic costs.
+Native unbounded leases are controls with a different retention guarantee;
+four-worker batches perform four times the single-worker work. No application
+speedup follows from this microbenchmark.
+
 ### Lease benchmarks
 
 Run `cargo bench --bench leases` for synthetic cold allocation, warm reuse,

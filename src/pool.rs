@@ -17,6 +17,11 @@ use std::{fmt, marker::PhantomData, sync::Arc};
 
 mod lease;
 pub use self::lease::{OwnedLease, SharedLease};
+mod managed;
+pub use self::managed::{
+    CacheLimits, CacheStats, ManagedAcquireError, ManagedLease, ManagedPool, ManagedSharedLease,
+    Recyclable, Trimmed,
+};
 
 /// A lock-free concurrent object pool.
 ///

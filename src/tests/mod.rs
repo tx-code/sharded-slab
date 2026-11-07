@@ -70,6 +70,8 @@ mod custom_config;
 #[cfg(loom)]
 mod loom_leases;
 #[cfg(loom)]
+mod loom_managed;
+#[cfg(loom)]
 mod loom_pool;
 #[cfg(loom)]
 mod loom_slab;

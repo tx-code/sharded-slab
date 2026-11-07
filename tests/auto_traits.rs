@@ -38,6 +38,23 @@ assert_not_impl!(pool::OwnedLease<ThreadBound>: Send);
 assert_not_impl!(pool::SharedLease<ThreadBound>: Send);
 assert_not_impl!(pool::SharedLease<ThreadBound>: Sync);
 
+#[derive(Default)]
+struct Reported<T: Clear + Default>(T);
+impl<T: Clear + Default> Clear for Reported<T> {
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+impl<T: Clear + Default> pool::Recyclable for Reported<T> {
+    fn retained_bytes(&self) -> usize {
+        0
+    }
+}
+assert_not_impl!(pool::ManagedPool<Reported<ThreadBound>>: Sync);
+assert_not_impl!(pool::ManagedLease<Reported<ThreadBound>>: Send);
+assert_not_impl!(pool::ManagedSharedLease<Reported<ThreadBound>>: Send);
+assert_not_impl!(pool::ManagedSharedLease<Reported<ThreadBound>>: Sync);
+
 #[test]
 fn supported_auto_traits() {
     fn send<T: Send>() {}
@@ -51,6 +68,11 @@ fn supported_auto_traits() {
     send::<pool::OwnedLease<String>>();
     send::<pool::SharedLease<String>>();
     sync::<pool::SharedLease<String>>();
+    send::<pool::ManagedPool<Vec<u8>>>();
+    sync::<pool::ManagedPool<Vec<u8>>>();
+    send::<pool::ManagedLease<Vec<u8>>>();
+    send::<pool::ManagedSharedLease<Vec<u8>>>();
+    sync::<pool::ManagedSharedLease<Vec<u8>>>();
     sync::<Slab<String>>();
     sync::<Pool<String>>();
     // &guard 只暴露共享读取；共享借用不移动拥有者及其析构责任。

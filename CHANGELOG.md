@@ -2,6 +2,8 @@
 
 ### Features
 
+- Add optional `pool::ManagedPool` with reported idle-payload byte/count limits, lazy value construction, close/trim, weak return routes and active-reader-safe reclamation. Backing slab pages and active memory are outside its payload budget.
+
 - Add `Pool::lease_owned`, `pool::OwnedLease` and cloneable `pool::SharedLease` for automatic clearing, exclusive cross-thread transfer and last-reader reclamation without raw keys.
 
 ### Safety fixes

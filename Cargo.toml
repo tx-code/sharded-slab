@@ -40,6 +40,10 @@ harness = false
 name = "lease_batches"
 harness = false
 
+[[bench]]
+name = "managed"
+harness = false
+
 [dependencies]
 lazy_static = "1"
 
