@@ -6,6 +6,80 @@ use loom::{
 };
 use std::sync::Arc;
 
+struct TwoSlots;
+impl crate::Config for TwoSlots {
+    const INITIAL_PAGE_SIZE: usize = 2;
+    const MAX_PAGES: usize = 1;
+}
+
+#[test]
+fn failed_batch_keeps_existing_reader_and_returns_partial_slots() {
+    run_model(
+        "failed_batch_keeps_existing_reader_and_returns_partial_slots",
+        || {
+            let pool = Arc::new(Pool::<Buffer>::new_with_config::<TwoSlots>());
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut value = pool.clone().lease_owned().unwrap();
+            value.data.push(47);
+            value.cleared = Some(count.clone());
+            let root = value.freeze();
+            let reader = root.clone();
+            let worker = thread::spawn(move || {
+                assert_eq!(reader.data, [47]);
+                drop(reader);
+            });
+            let failed: Option<Vec<_>> = (0..2).map(|_| pool.clone().lease_owned()).collect();
+            assert!(failed.is_none());
+            let free = pool.clone().lease_owned().unwrap();
+            assert!(free.data.is_empty());
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            drop(free);
+            worker.join().unwrap();
+            assert_eq!(root.data, [47]);
+            drop(root);
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            let all: Option<Vec<_>> = (0..2).map(|_| pool.clone().lease_owned()).collect();
+            assert_eq!(all.unwrap().len(), 2);
+        },
+    );
+}
+
+#[test]
+fn complete_batch_can_be_transferred_and_frozen_on_another_thread() {
+    run_model(
+        "complete_batch_can_be_transferred_and_frozen_on_another_thread",
+        || {
+            let pool = Arc::new(Pool::<Buffer>::new_with_config::<TwoSlots>());
+            let count = Arc::new(AtomicUsize::new(0));
+            let batch: Option<Vec<_>> = (0..2).map(|_| pool.clone().lease_owned()).collect();
+            let mut batch = batch.unwrap();
+            for (index, value) in batch.iter_mut().enumerate() {
+                value.data.push(index);
+                value.cleared = Some(count.clone());
+            }
+            let roots = thread::spawn(move || {
+                batch
+                    .into_iter()
+                    .map(|value| value.freeze())
+                    .collect::<Vec<_>>()
+            })
+            .join()
+            .unwrap();
+            drop(pool);
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            thread::spawn(move || {
+                for (index, value) in roots.iter().enumerate() {
+                    assert_eq!(value.data, [index]);
+                }
+                drop(roots);
+            })
+            .join()
+            .unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 2);
+        },
+    );
+}
+
 #[derive(Default)]
 struct Buffer {
     data: Vec<usize>,

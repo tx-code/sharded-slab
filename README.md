@@ -245,6 +245,14 @@ benchmarks include channel handoff and completion acknowledgement. The
 four-worker result measures four times the work of the one-worker result.
 Results are microbenchmarks and do not establish application speedups.
 
+`cargo bench --bench lease_batches` compares collecting existing leases into
+`Option<Vec<_>>` with a loop that reserves the handle vector in advance. It
+includes full batch acquisition, synthetic payload writes and clearing, partial
+capacity failure, and cross-thread batch return with a completion acknowledgement.
+These are caller-side compositions of the same lease API, not new global or
+cross-pool reservation primitives. User-defined `Default` and `Clear` still run
+synchronously, and panics are not converted into capacity failure.
+
 ## License
 
 This project is licensed under the [MIT license](LICENSE).

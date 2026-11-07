@@ -655,6 +655,27 @@ where
     /// assert_eq!(&**other, &[1, 2, 3]);
     /// drop(other); // The last reader clears the vector, retaining capacity.
     /// ```
+    ///
+    /// Several exclusive leases can be collected without a separate batch API:
+    ///
+    /// ```
+    /// use sharded_slab::Pool;
+    /// use std::sync::Arc;
+    /// let pool = Arc::new(Pool::<Vec<u64>>::new());
+    /// let batch: Option<Vec<_>> = (0..8)
+    ///     .map(|_| pool.clone().lease_owned())
+    ///     .collect();
+    /// if let Some(batch) = batch {
+    ///     assert_eq!(batch.len(), 8);
+    /// } // All leases are cleared on drop.
+    /// ```
+    ///
+    /// If a checkout returns `None`, collection drops the partial batch before
+    /// returning `None`. This is result-level all-or-nothing ownership, not a
+    /// transactional or fair reservation of capacity across threads or pools.
+    /// It does not wait for occupied slots, but allocation and user-defined
+    /// [`Clear`] work still run synchronously. A panic is not converted to
+    /// capacity failure; in particular a panicking `Clear` propagates.
     pub fn lease_owned(self: Arc<Self>) -> Option<OwnedLease<T, C>> {
         self.create_owned().map(OwnedLease::new)
     }
