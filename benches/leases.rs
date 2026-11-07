@@ -191,6 +191,47 @@ fn parallel(c: &mut Criterion) {
         for worker in threads {
             worker.join().unwrap();
         }
+
+        let pool = Arc::new(Pool::<Vec<u64>>::new());
+        let mut commands = Vec::new();
+        let mut threads = Vec::new();
+        for _ in 0..workers {
+            let pool = pool.clone();
+            let (tx, rx) = mpsc::channel::<()>();
+            let (done, ack) = mpsc::channel();
+            threads.push(thread::spawn(move || {
+                for () in rx {
+                    for _ in 0..64 {
+                        let mut value = pool.clone().create_owned().unwrap();
+                        value.extend(0..64);
+                        black_box(value.len());
+                        let key = value.key();
+                        drop(value);
+                        assert!(pool.clear(key));
+                    }
+                    done.send(()).unwrap();
+                }
+            }));
+            commands.push((tx, ack));
+        }
+        group.bench_with_input(
+            BenchmarkId::new("manual_batch_64_per_worker", workers),
+            &workers,
+            |b, _| {
+                b.iter(|| {
+                    for (tx, _) in &commands {
+                        tx.send(()).unwrap();
+                    }
+                    for (_, ack) in &commands {
+                        ack.recv().unwrap();
+                    }
+                });
+            },
+        );
+        drop(commands);
+        for worker in threads {
+            worker.join().unwrap();
+        }
     }
     group.finish();
 }
