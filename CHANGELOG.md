@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Features
+
+- Add `Pool::lease_owned`, `pool::OwnedLease` and cloneable `pool::SharedLease` for automatic clearing, exclusive cross-thread transfer and last-reader reclamation without raw keys.
+
 ### Safety fixes
 
 - Require `Send + Sync` when sharing a pool/slab or moving a guard can transfer or destroy stored values across threads. Read-only shared guard borrows retain their `Sync` support.

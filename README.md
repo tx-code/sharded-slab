@@ -207,6 +207,44 @@ performance across concurrent accesses.
 [benchmarks]: https://github.com/hawkw/sharded-slab/blob/master/benches/bench.rs
 [`criterion`]: https://crates.io/crates/criterion
 
+### Owned leases
+
+`Arc<Pool<T>>::lease_owned()` returns an exclusive `pool::OwnedLease<T>`.
+Dropping it clears the value without publishing a raw key. Calling `freeze()`
+consumes the exclusive lease and returns a cloneable `pool::SharedLease<T>`;
+the last reader requests clearing. Leases retain the pool independently of the
+caller's pool handle and can move between threads when the value permits it.
+The original `create`/`create_owned` publication APIs keep their semantics.
+
+```rust
+use sharded_slab::Pool;
+use std::sync::Arc;
+
+let pool = Arc::new(Pool::<Vec<u64>>::new());
+let mut block = pool.clone().lease_owned().unwrap();
+block.extend_from_slice(&[1, 2, 3]);
+let reader = block.freeze();
+let other = reader.clone();
+drop(pool);
+drop(reader);
+assert_eq!(&**other, &[1, 2, 3]);
+drop(other);
+```
+
+`Clear` determines which capacities are retained. Pool pages are retained until
+the last pool owner is released; leases do not provide a byte budget, page
+trimming, permanent identities, or application transaction rollback.
+
+### Lease benchmarks
+
+Run `cargo bench --bench leases` for synthetic cold allocation, warm reuse,
+read-only sharing, cross-thread return and one/four-worker batches. Manual
+guard/clear paths are controls; `exclusive_vec_floor` is an exclusive-access
+cost floor, not an equivalent shared-container implementation. Cross-thread
+benchmarks include channel handoff and completion acknowledgement. The
+four-worker result measures four times the work of the one-worker result.
+Results are microbenchmarks and do not establish application speedups.
+
 ## License
 
 This project is licensed under the [MIT license](LICENSE).

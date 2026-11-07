@@ -15,6 +15,9 @@ use crate::{
 
 use std::{fmt, marker::PhantomData, sync::Arc};
 
+mod lease;
+pub use self::lease::{OwnedLease, SharedLease};
+
 /// A lock-free concurrent object pool.
 ///
 /// Slabs provide pre-allocated storage for many instances of a single type. But, when working with
@@ -631,6 +634,31 @@ where
         })
     }
 
+    /// Borrows an owned, exclusive value that is automatically cleared on drop.
+    ///
+    /// Unlike [`create_owned`](Self::create_owned), dropping the returned lease
+    /// does not publish the value by key. Use [`OwnedLease::freeze`] to share
+    /// read-only ownership; its last reader clears the value instead.
+    /// Retained capacity follows the value's [`Clear`] implementation.
+    ///
+    /// Returns `None` under the same capacity limits as `create_owned`.
+    ///
+    /// ```
+    /// use sharded_slab::Pool;
+    /// use std::sync::Arc;
+    /// let pool = Arc::new(Pool::<Vec<usize>>::new());
+    /// let mut value = pool.clone().lease_owned().unwrap();
+    /// value.extend_from_slice(&[1, 2, 3]);
+    /// let reader = value.freeze();
+    /// let other = reader.clone();
+    /// drop(reader);
+    /// assert_eq!(&**other, &[1, 2, 3]);
+    /// drop(other); // The last reader clears the vector, retaining capacity.
+    /// ```
+    pub fn lease_owned(self: Arc<Self>) -> Option<OwnedLease<T, C>> {
+        self.create_owned().map(OwnedLease::new)
+    }
+
     /// Creates a new object in the pool with the provided initializer,
     /// returning a key that may be used to access the new object.
     ///
@@ -1186,6 +1214,13 @@ where
     T: Clear + Default,
     C: cfg::Config,
 {
+    fn discard(mut self) {
+        self.inner.abandon();
+        // clear(key)拒绝尚未发布的Removing槽；此处独占guard才有直接清理权。
+        let shard = self.shard().expect("owned guard's shard must exist");
+        shard.clear_after_release(self.key);
+    }
+
     /// Returns the key used to access this guard
     pub fn key(&self) -> usize {
         self.key

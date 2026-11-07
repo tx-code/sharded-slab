@@ -32,6 +32,10 @@ maintenance = { status = "experimental" }
 name = "bench"
 harness = false
 
+[[bench]]
+name = "leases"
+harness = false
+
 [dependencies]
 lazy_static = "1"
 

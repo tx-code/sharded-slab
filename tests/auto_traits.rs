@@ -34,6 +34,9 @@ assert_not_impl!(pool::OwnedRef<ThreadBound>: Send);
 assert_not_impl!(pool::OwnedRefMut<ThreadBound>: Send);
 assert_not_impl!(pool::OwnedRefMut<SendOnly>: Send);
 assert_not_impl!(Pool<SendOnly>: Sync);
+assert_not_impl!(pool::OwnedLease<ThreadBound>: Send);
+assert_not_impl!(pool::SharedLease<ThreadBound>: Send);
+assert_not_impl!(pool::SharedLease<ThreadBound>: Sync);
 
 #[test]
 fn supported_auto_traits() {
@@ -45,6 +48,9 @@ fn supported_auto_traits() {
     send::<OwnedEntry<String>>();
     send::<pool::OwnedRef<String>>();
     send::<pool::OwnedRefMut<String>>();
+    send::<pool::OwnedLease<String>>();
+    send::<pool::SharedLease<String>>();
+    sync::<pool::SharedLease<String>>();
     sync::<Slab<String>>();
     sync::<Pool<String>>();
     // &guard 只暴露共享读取；共享借用不移动拥有者及其析构责任。

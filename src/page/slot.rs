@@ -834,6 +834,12 @@ impl<T, C: cfg::Config> InitGuard<T, C> {
         self.release2(0)
     }
 
+    // 弃置尚未发布的独占值；调用者接管清理，Drop不能再把它发布为Present。
+    pub(crate) fn abandon(&mut self) {
+        debug_assert!(!self.released, "initialization guard already released");
+        self.released = true;
+    }
+
     /// Downgrades the guard to an immutable guard
     ///
     /// ## Safety
