@@ -257,11 +257,18 @@ the leases use weak return routes and remain valid independently. Callback
 panic propagates; clear/report panic quarantines its backing slot until the
 pool is destroyed. The controller is shared with `Arc`, not cloned by value.
 
+Used slots can retain inactive weak return routes until the backing pool is
+destroyed. These routes keep only the weak-reference allocation, not the
+controller or cached payloads, alive.
+
 Run `cargo bench --bench managed` for the optional policy's cold/warm, disabled
 retention, trim, close-with-reader, handoff and one/four-worker synthetic costs.
 Native unbounded leases are controls with a different retention guarantee;
 four-worker batches perform four times the single-worker work. No application
 speedup follows from this microbenchmark.
+The isolated-controller cases split the same aggregate idle limits between
+workers to diagnose shared-state contention. They do not implement a shared
+controller or interchangeable cross-worker capacity.
 
 ### Lease benchmarks
 

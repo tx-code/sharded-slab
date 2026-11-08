@@ -58,6 +58,42 @@ fn close_races_last_remote_reader() {
 }
 
 #[test]
+fn reused_admission_returns_once_when_close_races_remote_readers() {
+    run_model(
+        "reused_admission_returns_once_when_close_races_remote_readers",
+        || {
+            let pool = Arc::new(ManagedPool::<Buffer>::new(CacheLimits::new(1024, 2)));
+            let count = Arc::new(AtomicUsize::new(0));
+            for _ in 0..2 {
+                let mut value = pool.try_lease_owned().unwrap();
+                value.data.push(71);
+                value.cleared = Some(count.clone());
+                drop(value);
+            }
+            let mut value = pool.try_lease_owned().unwrap();
+            value.data.push(73);
+            value.cleared = Some(count.clone());
+            let root = value.freeze();
+            let reader = root.clone();
+            let worker = thread::spawn(move || {
+                assert_eq!(reader.data, [73]);
+                drop(reader);
+            });
+            let closer = pool.clone();
+            let close = thread::spawn(move || {
+                closer.close();
+            });
+            drop(root);
+            worker.join().unwrap();
+            close.join().unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 3);
+            assert_eq!(pool.stats().active_leases, 0);
+            assert_eq!(pool.stats().cached_values, 0);
+        },
+    );
+}
+
+#[test]
 fn concurrent_returns_cannot_exceed_idle_budget() {
     run_model("concurrent_returns_cannot_exceed_idle_budget", || {
         let pool = Arc::new(ManagedPool::<Buffer>::new(CacheLimits::new(64, 1)));

@@ -194,8 +194,11 @@ impl<T: Recyclable> Clear for Entry<T> {
         let permit = self.permit.take();
         if let Some(mut value) = self.value.take() {
             value.clear();
-            if let Some(permit) = permit {
+            if let Some(mut permit) = permit {
                 permit.recycle(value);
+                // 同一槽复用弱归还路由，避免每次借还都修改全局weak计数。
+                // 回调panic时局部permit仍会销毁；成功后仅留下失活路由。
+                self.permit = Some(permit);
             }
         }
     }
@@ -215,7 +218,7 @@ impl<T: Recyclable> Permit<T> {
         }
         cache
     }
-    fn recycle(mut self, value: T) {
+    fn recycle(&mut self, value: T) {
         // Clear已成功；后续容量计算或Drop panic不能使active许可遗留。
         if let Some(cache) = self.deactivate() {
             cache.put_clean(value);
@@ -229,7 +232,7 @@ impl<T: Recyclable> Drop for Permit<T> {
 }
 
 impl<T: Recyclable> Cache<T> {
-    fn checkout(self: &Arc<Self>) -> Result<(Option<T>, Permit<T>), ManagedAcquireError> {
+    fn checkout(&self) -> Result<Option<T>, ManagedAcquireError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed {
             return Err(ManagedAcquireError::Closed);
@@ -245,13 +248,7 @@ impl<T: Recyclable> Cache<T> {
         } else {
             state.misses = state.misses.saturating_add(1);
         }
-        Ok((
-            value,
-            Permit {
-                cache: Arc::downgrade(self),
-                active: true,
-            },
-        ))
+        Ok(value)
     }
 
     fn put_clean(&self, value: T) {
@@ -361,9 +358,17 @@ impl<T: Recyclable, C: cfg::Config> ManagedPool<T, C> {
             .clone()
             .lease_owned()
             .ok_or(ManagedAcquireError::Capacity)?;
-        let (value, permit) = self.cache.checkout()?;
+        let value = self.cache.checkout()?;
         // Default panic时底层独占租约清理Entry，已安装的permit自动退回许可。
-        inner.permit = Some(permit);
+        if let Some(ref mut permit) = inner.permit {
+            debug_assert!(!permit.active);
+            permit.active = true;
+        } else {
+            inner.permit = Some(Permit {
+                cache: Arc::downgrade(&self.cache),
+                active: true,
+            });
+        }
         inner.value = Some(value.unwrap_or_default());
         Ok(ManagedLease { inner })
     }
@@ -524,5 +529,27 @@ mod tests {
         assert!(state.idle.is_empty());
         drop(state);
         assert_eq!(pool.stats().cached_bytes, 0);
+    }
+
+    #[test]
+    fn abandoned_inactive_slot_does_not_release_another_admission() {
+        let pool = ManagedPool::<Vec<u8>>::new(CacheLimits::new(1024, 2));
+        drop(pool.try_lease_owned().unwrap());
+        // 模拟槽已取得但随后close拒绝准入；旧失活路由不能扣别人的许可。
+        let abandoned = pool.slots.clone().lease_owned().unwrap();
+        let mut survivor = pool.try_lease_owned().unwrap();
+        survivor.push(73);
+        pool.close();
+        assert_eq!(
+            pool.cache.checkout().err(),
+            Some(ManagedAcquireError::Closed)
+        );
+        drop(abandoned);
+        assert_eq!(pool.stats().active_leases, 1);
+        let cache = Arc::downgrade(&pool.cache);
+        drop(pool);
+        assert!(cache.upgrade().is_none());
+        assert_eq!(&**survivor, &[73]);
+        std::thread::spawn(move || drop(survivor)).join().unwrap();
     }
 }

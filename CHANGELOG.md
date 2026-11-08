@@ -11,6 +11,10 @@
 - Require `Send + Sync` when sharing a pool/slab or moving a guard can transfer or destroy stored values across threads. Read-only shared guard borrows retain their `Sync` support.
 - Keep reclaimed slots reserved until publication, and reject `take` on unpublished or already-removing slots.
 
+### Performance
+
+- Reuse inactive managed return routes with backing slots, avoiding repeated weak-reference count changes on warm checkout/return. Cache admission, idle limits and last-reader cleanup semantics are unchanged.
+
 <a name="v0.1.7"></a>
 ### v0.1.7 (2023-10-04)
 

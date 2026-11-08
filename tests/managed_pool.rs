@@ -257,6 +257,41 @@ fn default_panic_rolls_back_admission_without_caching() {
     );
 }
 
+#[test]
+fn reused_admission_panics_leave_independent_readers_and_controller_drop_safe() {
+    for report in [false, true].iter().copied() {
+        let pool = Arc::new(ManagedPool::<Watched>::new(CacheLimits::new(1024, 2)));
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        for _ in 0..8 {
+            let mut value = pool.try_lease_owned().unwrap();
+            value.data.push(79);
+            value.cleared = Some(cleared.clone());
+            value.dropped = Some(dropped.clone());
+            drop(value);
+            assert_eq!(pool.stats().active_leases, 0);
+        }
+        let mut failing = pool.try_lease_owned().unwrap();
+        failing.cleared = Some(cleared.clone());
+        failing.panic_report = report;
+        failing.panic_clear = !report;
+        let mut survivor = pool.try_lease_owned().unwrap();
+        survivor.data.push(83);
+        survivor.cleared = Some(cleared.clone());
+        survivor.dropped = Some(dropped.clone());
+        let reader = survivor.freeze();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(failing))).is_err());
+        assert_eq!(pool.stats().active_leases, 1);
+        assert_eq!(pool.stats().cached_values, 0);
+        pool.close();
+        drop(pool);
+        assert_eq!(reader.data, [83]);
+        std::thread::spawn(move || drop(reader)).join().unwrap();
+        assert_eq!(cleared.load(Ordering::SeqCst), 10);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+}
+
 type Gate = (mpsc::Sender<()>, mpsc::Receiver<()>);
 thread_local! { static DEFAULT_GATE: RefCell<Option<Gate>> = RefCell::new(None); }
 

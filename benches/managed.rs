@@ -162,7 +162,7 @@ fn handoff(c: &mut Criterion) {
     group.finish();
 }
 
-fn parallel_case<F: Fn() + Send + Sync + 'static>(
+fn parallel_case<F: Fn(usize) + Send + Sync + 'static>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     name: &str,
     workers: usize,
@@ -171,14 +171,14 @@ fn parallel_case<F: Fn() + Send + Sync + 'static>(
     let action = Arc::new(action);
     let mut commands = Vec::new();
     let mut threads = Vec::new();
-    for _ in 0..workers {
+    for index in 0..workers {
         let action = action.clone();
         let (tx, rx) = mpsc::channel::<()>();
         let (done, ack) = mpsc::channel();
         threads.push(thread::spawn(move || {
             for () in rx {
                 for _ in 0..64 {
-                    action();
+                    action(index);
                 }
                 done.send(()).unwrap();
             }
@@ -213,7 +213,7 @@ fn parallel(c: &mut Criterion) {
             &mut group,
             "cached_batch64_per_worker",
             workers,
-            move || {
+            move |_| {
                 let mut value = pool.try_lease_owned().unwrap();
                 value.extend_from_slice(black_box(&[3u64; 64]));
                 black_box(&value[..]);
@@ -225,8 +225,23 @@ fn parallel(c: &mut Criterion) {
             &mut group,
             "native_batch64_per_worker",
             workers,
-            move || {
+            move |_| {
                 let mut value = native.clone().lease_owned().unwrap();
+                value.extend_from_slice(black_box(&[3u64; 64]));
+                black_box(&value[..]);
+                drop(value);
+            },
+        );
+        // 总idle上限不变；仅把控制器分开，用于区分共享元数据与载荷工作。
+        let pools: Vec<_> = (0..workers)
+            .map(|_| ManagedPool::<Vec<u64>>::new(CacheLimits::new(65536 / workers, 16 / workers)))
+            .collect();
+        parallel_case(
+            &mut group,
+            "isolated_cached_batch64_per_worker",
+            workers,
+            move |index| {
+                let mut value = pools[index].try_lease_owned().unwrap();
                 value.extend_from_slice(black_box(&[3u64; 64]));
                 black_box(&value[..]);
                 drop(value);
