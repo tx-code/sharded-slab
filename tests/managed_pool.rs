@@ -292,6 +292,182 @@ fn reused_admission_panics_leave_independent_readers_and_controller_drop_safe() 
     }
 }
 
+#[derive(Clone, Copy)]
+enum ReturnStage {
+    Clear,
+    Report,
+    Dispose,
+}
+struct ReturnBarrier {
+    stage: ReturnStage,
+    started: mpsc::Sender<()>,
+    proceed: Arc<std::sync::Mutex<mpsc::Receiver<()>>>,
+}
+impl ReturnBarrier {
+    fn wait(&self, stage: ReturnStage) {
+        if std::mem::discriminant(&self.stage) == std::mem::discriminant(&stage) {
+            self.started.send(()).unwrap();
+            self.proceed.lock().unwrap().recv().unwrap();
+        }
+    }
+}
+fn return_barrier(stage: ReturnStage) -> (ReturnBarrier, mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (started, ready) = mpsc::channel();
+    let (resume, proceed) = mpsc::channel();
+    (
+        ReturnBarrier {
+            stage,
+            started,
+            proceed: Arc::new(std::sync::Mutex::new(proceed)),
+        },
+        ready,
+        resume,
+    )
+}
+#[derive(Default)]
+struct ReturningProbe {
+    data: Vec<u8>,
+    barrier: Option<ReturnBarrier>,
+}
+impl Clear for ReturningProbe {
+    fn clear(&mut self) {
+        if let Some(ref barrier) = self.barrier {
+            barrier.wait(ReturnStage::Clear);
+        }
+        self.data.clear();
+    }
+}
+impl Recyclable for ReturningProbe {
+    fn retained_bytes(&self) -> usize {
+        if let Some(ref barrier) = self.barrier {
+            barrier.wait(ReturnStage::Report);
+        }
+        self.data.capacity()
+    }
+}
+impl Drop for ReturningProbe {
+    fn drop(&mut self) {
+        if let Some(ref barrier) = self.barrier {
+            barrier.wait(ReturnStage::Dispose);
+        }
+    }
+}
+
+#[test]
+fn incomplete_clear_and_report_are_visible_until_callback_completion() {
+    for stage in [ReturnStage::Clear, ReturnStage::Report].iter().copied() {
+        let pool = ManagedPool::<ReturningProbe>::new(CacheLimits::new(256, 2));
+        let (barrier, ready, resume) = return_barrier(stage);
+        let mut value = pool.try_lease_owned().unwrap();
+        value.data.resize(128, 1);
+        value.barrier = Some(barrier);
+        let worker = std::thread::spawn(move || drop(value));
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.cached_values, 0);
+        assert_eq!(stats.returning_values, 1);
+        assert_eq!(stats.unreported_returning_values, 1);
+        assert_eq!(stats.reported_returning_bytes, 0);
+        assert_eq!(stats.active_leases, 1);
+        pool.close();
+        resume.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(pool.stats().returning_values, 0);
+        assert_eq!(pool.stats().active_leases, 0);
+    }
+}
+
+#[test]
+fn rejected_reported_payload_stays_accounted_until_destructor_finishes() {
+    let mut limits = CacheLimits::new(256, 2);
+    limits.max_value_bytes = 0;
+    let pool = ManagedPool::<ReturningProbe>::new(limits);
+    let (barrier, ready, resume) = return_barrier(ReturnStage::Dispose);
+    let mut value = pool.try_lease_owned().unwrap();
+    value.data.resize(128, 1);
+    value.barrier = Some(barrier);
+    let worker = std::thread::spawn(move || drop(value));
+    ready
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let stats = pool.stats();
+    assert_eq!(stats.cached_values, 0);
+    assert_eq!(stats.active_leases, 0);
+    assert_eq!(stats.returning_values, 1);
+    assert_eq!(stats.reported_returning_bytes, 128);
+    assert_eq!(stats.unreported_returning_values, 0);
+    resume.send(()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(pool.stats().returning_values, 0);
+}
+
+#[test]
+fn detached_trim_and_close_batches_stay_accounted_during_payload_drop() {
+    for close in [false, true].iter().copied() {
+        let pool = Arc::new(ManagedPool::<ReturningProbe>::new(CacheLimits::new(256, 2)));
+        let (barrier, ready, resume) = return_barrier(ReturnStage::Dispose);
+        let mut first = pool.try_lease_owned().unwrap();
+        let mut second = pool.try_lease_owned().unwrap();
+        first.data.resize(128, 1);
+        second.data.resize(128, 2);
+        first.barrier = Some(barrier);
+        drop(first);
+        drop(second);
+        let control = pool.clone();
+        let worker = std::thread::spawn(move || {
+            if close {
+                control.close()
+            } else {
+                control.trim()
+            }
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.closed, close);
+        assert_eq!(stats.cached_values, 0);
+        assert_eq!(stats.active_leases, 0);
+        assert_eq!(stats.returning_values, 2);
+        assert_eq!(stats.reported_returning_bytes, 256);
+        assert_eq!(stats.reserved_cache_values, 0);
+        resume.send(()).unwrap();
+        let removed = worker.join().unwrap();
+        assert_eq!(removed.values, 2);
+        assert_eq!(removed.bytes, 256);
+        assert_eq!(pool.stats().returning_values, 0);
+    }
+}
+
+struct OneSlot;
+impl Config for OneSlot {
+    const INITIAL_PAGE_SIZE: usize = 1;
+    const MAX_PAGES: usize = 1;
+}
+
+#[test]
+fn clear_and_report_panics_restore_exact_single_slot_capacity() {
+    for report in [false, true].iter().copied() {
+        let pool = ManagedPool::<Watched>::new_with_config::<OneSlot>(CacheLimits::new(256, 1));
+        let mut value = pool.try_lease_owned().unwrap();
+        value.panic_clear = !report;
+        value.panic_report = report;
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))).is_err());
+        assert_eq!(pool.stats().active_leases, 0);
+        assert_eq!(pool.stats().returning_values, 0);
+        let next = pool
+            .try_lease_owned()
+            .expect("detached callback panic must return the sole backing slot");
+        assert_eq!(
+            pool.try_lease_owned().err(),
+            Some(ManagedAcquireError::Capacity)
+        );
+        drop(next);
+    }
+}
+
 type Gate = (mpsc::Sender<()>, mpsc::Receiver<()>);
 thread_local! { static DEFAULT_GATE: RefCell<Option<Gate>> = RefCell::new(None); }
 

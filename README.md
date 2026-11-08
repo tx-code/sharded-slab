@@ -244,7 +244,7 @@ idle bytes, value count, and one value's report, not active allocations, cache
 metadata, backing slab pages, shared dependencies or RSS.
 
 `try_lease_owned()` distinguishes closed admission from backing-slot capacity.
-Admission linearizes under the controller lock; requests admitted before
+Admission linearizes under the selected return-shard lock; requests admitted before
 `close()` may finish lazy `Default` afterward and remain usable. Close drains
 idle payloads and rejects new admission; live exclusive/shared leases are not
 cleared. `trim()` removes then-idle payloads, and concurrent returns may refill
@@ -254,12 +254,23 @@ Payload `Default`, `Clear`, byte reporting and destruction run outside cache
 locks. Returns may discard instead of caching on contention or limits; cache
 capacity is preallocated. Dropping the controller closes idle retention, while
 the leases use weak return routes and remain valid independently. Callback
-panic propagates; clear/report panic quarantines its backing slot until the
-pool is destroyed. The controller is shared with `Arc`, not cloned by value.
+panic propagates. Clear/report panics dispose the detached value and reclaim the
+empty backing slot; a panicking destructor during backing disposal can still
+quarantine that slot. The controller is shared with `Arc`, not cloned by value.
 
-Used slots can retain inactive weak return routes until the backing pool is
-destroyed. These routes keep only the weak-reference allocation, not the
-controller or cached payloads, alive.
+Idle return shards retain existing reserved pool leases, with one reusable boxed
+guard per live reservation. A controller-wide credit total bounds all shards;
+unused credits and idle reservations can be borrowed across shards. Close and
+trim take one all-shard snapshot and dispose detached values after unlocking.
+The guard boxes, return-record metadata, idle directories and slab pages are
+outside the reported payload budget. Shared managed readers keep one private
+exclusive reservation behind read-only `Arc` ownership, without publishing keys.
+
+Stats separately expose reserved credits, returning value counts, completed
+return reports and returns whose clear/report is incomplete or skipped. Detached
+trim/close batches remain reported until their actual disposal. Unreported bytes
+are unknown, not zero-sized allocations. Active and return diagnostics can
+overlap during cleanup and do not form a transactionally consistent heap snapshot.
 
 Run `cargo bench --bench managed` for the optional policy's cold/warm, disabled
 retention, trim, close-with-reader, handoff and one/four-worker synthetic costs.

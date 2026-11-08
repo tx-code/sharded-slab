@@ -13,7 +13,8 @@
 
 ### Performance
 
-- Reuse inactive managed return routes with backing slots, avoiding repeated weak-reference count changes on warm checkout/return. Cache admission, idle limits and last-reader cleanup semantics are unchanged.
+- Reuse reserved backing leases through bounded return shards, with controller-wide lendable byte/count credits and an all-shard close/trim snapshot. Boxed guards avoid repeatedly moving large backing reservations. Managed shared readers retain a private exclusive reservation until their last reader.
+- Report cleanup/disposal ownership separately from cached payload, including detached trim/close batches and explicitly unreported returns. Clear/report panics now reclaim the detached empty backing slot.
 
 <a name="v0.1.7"></a>
 ### v0.1.7 (2023-10-04)

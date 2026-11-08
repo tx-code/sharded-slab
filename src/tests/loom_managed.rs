@@ -181,3 +181,72 @@ fn trim_does_not_clear_a_retained_read_version() {
         assert_eq!(pool.stats().active_leases, 0);
     });
 }
+
+#[test]
+fn shard_credit_and_cached_reservations_race_trim_with_one_total_budget() {
+    run_model(
+        "shard_credit_and_cached_reservations_race_trim_with_one_total_budget",
+        || {
+            let pool = Arc::new(ManagedPool::<Buffer>::new(CacheLimits::new(64, 2)));
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut workers = Vec::new();
+            for index in 0..2 {
+                let pool = pool.clone();
+                let count = count.clone();
+                workers.push(thread::spawn(move || {
+                    for _ in 0..2 {
+                        let mut value = pool.try_lease_owned().unwrap();
+                        value.data.resize(8, index);
+                        value.cleared = Some(count.clone());
+                        drop(value);
+                    }
+                }));
+            }
+            let trimmer = pool.clone();
+            let trim = thread::spawn(move || {
+                trimmer.trim();
+            });
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            trim.join().unwrap();
+            let stats = pool.stats();
+            assert!(stats.cached_bytes <= 64);
+            assert!(stats.cached_values <= 2);
+            assert!(stats.reserved_cache_bytes <= 64);
+            assert!(stats.reserved_cache_values <= 2);
+            assert_eq!(stats.active_leases, 0);
+            assert_eq!(stats.returning_values, 0);
+            assert_eq!(count.load(Ordering::SeqCst), 4);
+        },
+    );
+}
+
+#[test]
+fn controller_retirement_disposes_idle_without_clearing_it_twice() {
+    run_model(
+        "controller_retirement_disposes_idle_without_clearing_it_twice",
+        || {
+            let pool = Arc::new(ManagedPool::<Buffer>::new(CacheLimits::new(1024, 2)));
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut warm = pool.try_lease_owned().unwrap();
+            warm.cleared = Some(count.clone());
+            drop(warm);
+            let mut active = pool.try_lease_owned().unwrap();
+            active.data.push(97);
+            active.cleared = Some(count.clone());
+            let reader = active.freeze();
+            let mut idle = pool.try_lease_owned().unwrap();
+            idle.cleared = Some(count.clone());
+            drop(idle);
+            assert_eq!(count.load(Ordering::SeqCst), 2);
+            drop(pool);
+            let worker = thread::spawn(move || {
+                assert_eq!(reader.data, [97]);
+                drop(reader);
+            });
+            worker.join().unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 3);
+        },
+    );
+}

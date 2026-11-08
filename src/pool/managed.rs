@@ -1,11 +1,11 @@
-use super::{OwnedLease, Pool, SharedLease};
+use super::{OwnedLease, Pool};
 use crate::{
     cfg,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     },
-    Clear, DefaultConfig,
+    Clear, DefaultConfig, Pack,
 };
 use std::{
     fmt, mem, ops,
@@ -62,8 +62,8 @@ impl CacheLimits {
 
 /// Diagnostics for a managed pool. No field is an active-memory hard limit.
 ///
-/// Idle fields are read under the cache lock. The independent active count may
-/// change concurrently; this is not a transactionally consistent heap snapshot.
+/// Idle fields are read with every return shard locked. Active and returning
+/// records change independently; this is not a consistent whole-heap snapshot.
 /// Hit/miss counters count admitted requests and saturate at `usize::MAX`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheStats {
@@ -80,8 +80,24 @@ pub struct CacheStats {
     pub active_leases: usize,
     /// Admitted requests that obtained an idle value.
     pub cache_hits: usize,
-    /// Admitted requests that needed `T::default`, including panicking defaults.
+    /// Admitted misses, including backing-capacity rejection or panicking Default.
     pub cache_misses: usize,
+    /// Credits reserved across idle shards, including temporarily unused credit.
+    pub reserved_cache_bytes: usize,
+    /// Reserved idle value credits across shards; bounded by the count limit.
+    pub reserved_cache_values: usize,
+    /// Values undergoing return or detached trim/close disposal. These diagnostic
+    /// counts can overlap `active_leases` while clear/report is still running.
+    pub returning_values: usize,
+    /// Saturating sum of completed reports for observed returns not yet disposed
+    /// or stored idle. Unreported returns are explicitly counted separately.
+    pub reported_returning_bytes: usize,
+    /// Observed returns whose clear/report is incomplete or intentionally skipped
+    /// after closure/disabled retention. Their byte size is not reported as zero.
+    pub unreported_returning_values: usize,
+    /// Known reclaim metadata storage excluding allocator/Arc headers, inline
+    /// backing entries and slab pages. Not included in the idle payload budget.
+    pub reclaim_storage_bytes: usize,
 }
 
 /// Idle values removed by trim/close, not bytes proven returned to the OS.
@@ -111,18 +127,18 @@ impl fmt::Display for ManagedAcquireError {
 }
 impl std::error::Error for ManagedAcquireError {}
 
-/// An optional bounded idle-payload policy on the existing sharded [`Pool`].
+/// Bounded idle ownership on the existing sharded pool and exclusive leases.
 ///
-/// Slab slots still use the backing pool's shards and local/remote free lists.
-/// Payloads move to a bounded, shared idle cache only after last-owner clearing.
-/// Cache hits can therefore reuse payloads returned by other workers. Returns
-/// use a weak controller route and may discard on lock contention or overflow.
-/// This does not evict backing slab pages or bound active allocations.
+/// Idle entries retain a reserved backing lease. Warm reuse does not allocate a
+/// new slot or clone the backing pool. Internal return shards borrow a single
+/// controller's byte/count credits; credits never exceed the configured total.
+/// Returns may discard on contention. Neither active memory nor slab pages are
+/// covered by the idle payload budget.
 ///
-/// Share the controller with `Arc<ManagedPool<_>>`. Dropping its last owner
-/// closes admission and drains idle payloads; active leases remain valid.
-/// Allocation and payload callbacks can panic; no recoverable OOM is implied.
-/// A panicking clear/report quarantines that backing slot until pool destruction.
+/// Share the controller with `Arc`. Its last owner closes and drains idle
+/// ownership, without invalidating active or shared readers. Payload callbacks
+/// run outside locks. Their panics propagate; detached payloads and admission
+/// permits are unwound before the empty backing slot is reclaimed.
 ///
 /// ```
 /// use sharded_slab::pool::{CacheLimits, ManagedAcquireError, ManagedPool};
@@ -138,302 +154,669 @@ impl std::error::Error for ManagedAcquireError {}
 /// assert_eq!(pool.stats().cached_bytes, 0);
 /// ```
 pub struct ManagedPool<T: Recyclable, C: cfg::Config = DefaultConfig> {
-    slots: Arc<Pool<Entry<T>, C>>,
-    cache: Arc<Cache<T>>,
+    slots: Arc<Pool<Entry<T, C>, C>>,
+    caches: Vec<Arc<Cache<T, C>>>,
+    policy: Arc<Policy<T, C>>,
 }
 
-/// Exclusive managed value; dropping it clears then caches or discards payload.
+/// Exclusive ownership. Drop clears, then caches the reserved lease or disposes it.
 #[must_use]
 pub struct ManagedLease<T: Recyclable, C: cfg::Config = DefaultConfig> {
-    inner: OwnedLease<Entry<T>, C>,
+    inner: Option<ReservedLease<T, C>>,
 }
 
-/// Cloneable managed read ownership; only the last reader returns its payload.
+// 大的底层guard只在首次reserve时装箱，热借还只移动这个拥有句柄。
+type ReservedLease<T, C> = Box<OwnedLease<Entry<T, C>, C>>;
+
+/// Read-only shared ownership; only the last reader clears and returns the value.
 #[must_use]
 pub struct ManagedSharedLease<T: Recyclable, C: cfg::Config = DefaultConfig> {
-    inner: SharedLease<Entry<T>, C>,
+    inner: crate::sync::Arc<ManagedLease<T, C>>,
 }
 
-struct Idle<T> {
-    value: T,
+const RECORD_IDLE: usize = 0;
+const RECORD_ACTIVE: usize = 1;
+const RECORD_CLEARING: usize = 2;
+const RECORD_REPORTED: usize = 3;
+const RECORD_DEAD: usize = 4;
+
+struct ReturnRecord {
+    phase: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+struct Idle<T: Recyclable, C: cfg::Config> {
+    lease: ReservedLease<T, C>,
     bytes: usize,
 }
-struct State<T> {
-    idle: Vec<Idle<T>>,
+struct State<T: Recyclable, C: cfg::Config> {
+    idle: Vec<Idle<T, C>>,
     bytes: usize,
-    closed: bool,
+    credit_bytes: usize,
+    credit_values: usize,
     hits: usize,
     misses: usize,
 }
-struct Cache<T: Recyclable> {
+struct Credits<T: Recyclable, C: cfg::Config> {
+    bytes: usize,
+    values: usize,
+    donors: Vec<Weak<Cache<T, C>>>,
+}
+struct Policy<T: Recyclable, C: cfg::Config> {
     limits: CacheLimits,
-    state: Mutex<State<T>>,
     closed: AtomicBool,
-    active: AtomicUsize,
-}
-struct Permit<T: Recyclable> {
-    cache: Weak<Cache<T>>,
-    active: bool,
-}
-struct Entry<T: Recyclable> {
-    value: Option<T>,
-    permit: Option<Permit<T>>,
+    operations: Mutex<()>,
+    credits: Mutex<Credits<T, C>>,
+    records: Mutex<Vec<Weak<ReturnRecord>>>,
 }
 
-impl<T: Recyclable> Default for Entry<T> {
+// 热借还只写所属分片；避免无关分片的计数/锁共享缓存行。
+#[repr(align(128))]
+struct Cache<T: Recyclable, C: cfg::Config> {
+    index: usize,
+    policy: Arc<Policy<T, C>>,
+    state: Mutex<State<T, C>>,
+    initializing: AtomicUsize,
+}
+struct Permit<T: Recyclable, C: cfg::Config> {
+    cache: Weak<Cache<T, C>>,
+    index: usize,
+    active: bool,
+    initializing: bool,
+}
+struct Entry<T: Recyclable, C: cfg::Config> {
+    value: Option<T>,
+    permit: Option<Permit<T, C>>,
+    record: Option<Arc<ReturnRecord>>,
+}
+
+impl<T: Recyclable, C: cfg::Config> Default for Entry<T, C> {
     fn default() -> Self {
         Self {
             value: None,
             permit: None,
-        }
-    }
-}
-impl<T: Recyclable> Clear for Entry<T> {
-    fn clear(&mut self) {
-        // 先移出资源；回调panic时permit仍会释放统计，槽不能被误发为干净。
-        let permit = self.permit.take();
-        if let Some(mut value) = self.value.take() {
-            value.clear();
-            if let Some(mut permit) = permit {
-                permit.recycle(value);
-                // 同一槽复用弱归还路由，避免每次借还都修改全局weak计数。
-                // 回调panic时局部permit仍会销毁；成功后仅留下失活路由。
-                self.permit = Some(permit);
-            }
+            record: None,
         }
     }
 }
 
-impl<T: Recyclable> Permit<T> {
-    fn deactivate(&mut self) -> Option<Arc<Cache<T>>> {
-        if !self.active {
-            return None;
+struct RetiringRecord(Option<Arc<ReturnRecord>>);
+impl Drop for RetiringRecord {
+    fn drop(&mut self) {
+        if let Some(ref record) = self.0 {
+            record.phase.store(RECORD_DEAD, Ordering::Release);
         }
-        let cache = self.cache.upgrade();
+    }
+}
+
+impl<T: Recyclable, C: cfg::Config> Clear for Entry<T, C> {
+    fn clear(&mut self) {
+        // 值进入idle前已经Clear；底层槽释放只析构，不再次调用用户Clear。
+        // 回调在ManagedLease中先移出值；异常路径的空槽也可安全归还。
+        let permit = self.permit.take();
+        let mut record = RetiringRecord(self.record.take());
+        drop(self.value.take());
+        drop(permit);
+        if let Some(record) = record.0.take() {
+            record.phase.store(RECORD_DEAD, Ordering::Release);
+            self.record = Some(record);
+        }
+    }
+}
+
+impl<T: Recyclable, C: cfg::Config> Permit<T, C> {
+    #[inline(always)]
+    fn release(&mut self, cache: &Cache<T, C>) {
         if self.active {
             self.active = false;
-            if let Some(ref cache) = cache {
-                cache.active.fetch_sub(1, Ordering::Relaxed);
+            if self.initializing {
+                self.initializing = false;
+                cache.initializing.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        cache
     }
-    fn recycle(&mut self, value: T) {
-        // Clear已成功；后续容量计算或Drop panic不能使active许可遗留。
-        if let Some(cache) = self.deactivate() {
-            cache.put_clean(value);
+}
+impl<T: Recyclable, C: cfg::Config> Drop for Permit<T, C> {
+    fn drop(&mut self) {
+        if self.active && self.initializing {
+            if let Some(cache) = self.cache.upgrade() {
+                self.release(&cache);
+            }
         }
     }
 }
-impl<T: Recyclable> Drop for Permit<T> {
-    fn drop(&mut self) {
-        self.deactivate();
+
+impl<T: Recyclable, C: cfg::Config> State<T, C> {
+    #[inline(always)]
+    fn store_idle(&mut self, idle: Idle<T, C>, total: usize) {
+        if let Some(ref record) = idle.lease.record {
+            record.phase.store(RECORD_IDLE, Ordering::Release);
+        }
+        debug_assert!(self.idle.len() < self.idle.capacity());
+        self.idle.push(idle);
+        self.bytes = total;
     }
 }
 
-impl<T: Recyclable> Cache<T> {
-    fn checkout(&self) -> Result<Option<T>, ManagedAcquireError> {
+impl<T: Recyclable, C: cfg::Config> Policy<T, C> {
+    // 调用方持operation，目录不含载荷，预留的8个句柄足以覆盖所有分片。
+    fn cache_handles(&self, handles: &mut Vec<Arc<Cache<T, C>>>) {
+        let credits = self.credits.lock().unwrap_or_else(|e| e.into_inner());
+        handles.extend(credits.donors.iter().filter_map(Weak::upgrade));
+    }
+}
+
+impl<T: Recyclable, C: cfg::Config> Cache<T, C> {
+    #[inline(always)]
+    fn checkout(&self) -> Result<Option<ReservedLease<T, C>>, ManagedAcquireError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.closed {
+        // close也持有此锁；读取closed是这个请求的准入点。
+        if self.policy.closed.load(Ordering::Acquire) {
             return Err(ManagedAcquireError::Closed);
         }
-        // 此锁下授予许可是admission线性化点；Default在解锁后执行。
-        self.active.fetch_add(1, Ordering::Relaxed);
-        let value = state.idle.pop().map(|idle| {
+        if let Some(idle) = state.idle.pop() {
             state.bytes -= idle.bytes;
-            idle.value
-        });
-        if value.is_some() {
             state.hits = state.hits.saturating_add(1);
-        } else {
-            state.misses = state.misses.saturating_add(1);
+            if let Some(ref record) = idle.lease.record {
+                record.phase.store(RECORD_ACTIVE, Ordering::Release);
+            }
+            return Ok(Some(idle.lease));
         }
-        Ok(value)
+        self.initializing.fetch_add(1, Ordering::Relaxed);
+        drop(state);
+        Ok(self.borrow_idle())
     }
 
-    fn put_clean(&self, value: T) {
-        if self.closed.load(Ordering::Acquire) || self.limits.max_cached_values == 0 {
-            return;
+    #[cold]
+    #[inline(never)]
+    fn borrow_idle(&self) -> Option<ReservedLease<T, C>> {
+        // 冷路径释放本分片锁后才取全局operation；所有多锁都按同一升序。
+        let mut caches = Vec::with_capacity(8);
+        let mut states = Vec::with_capacity(8);
+        let operation = self
+            .policy
+            .operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.policy.cache_handles(&mut caches);
+        for cache in &caches {
+            states.push(cache.state.lock().unwrap_or_else(|e| e.into_inner()));
         }
-        let bytes = value.retained_bytes();
-        if bytes > self.limits.max_value_bytes {
-            return;
+        let mut source = self.index;
+        if states[source].idle.is_empty() {
+            if let Some(index) = states.iter().position(|state| !state.idle.is_empty()) {
+                source = index;
+            }
         }
-        let mut rejected = Some(Idle { value, bytes });
+        let lease = if let Some(idle) = states[source].idle.pop() {
+            states[source].bytes -= idle.bytes;
+            states[self.index].hits = states[self.index].hits.saturating_add(1);
+            if let Some(ref record) = idle.lease.record {
+                record.phase.store(RECORD_ACTIVE, Ordering::Release);
+            }
+            self.initializing.fetch_sub(1, Ordering::Relaxed);
+            Some(idle.lease)
+        } else {
+            states[self.index].misses = states[self.index].misses.saturating_add(1);
+            None
+        };
+        drop(states);
+        drop(operation);
+        lease
+    }
+
+    #[inline(always)]
+    fn put_clean(&self, lease: ReservedLease<T, C>, bytes: usize) {
+        let mut rejected = Some(Idle { lease, bytes });
+        let mut needs_credit = false;
         {
-            // 归还可放弃缓存；不等待读者或持锁运行用户回调。
             if let Ok(mut state) = self.state.try_lock() {
-                if !state.closed && state.idle.len() < self.limits.max_cached_values {
+                if !self.policy.closed.load(Ordering::Acquire)
+                    && bytes <= self.policy.limits.max_value_bytes
+                {
                     if let Some(total) = state.bytes.checked_add(bytes) {
-                        if total <= self.limits.max_cached_bytes {
-                            state.idle.push(rejected.take().expect("clean idle value"));
-                            state.bytes = total;
+                        let count = state.idle.len() + 1;
+                        if total <= state.credit_bytes && count <= state.credit_values {
+                            state.store_idle(
+                                rejected.take().expect("owned idle reservation"),
+                                total,
+                            );
+                        } else {
+                            needs_credit = true;
                         }
                     }
                 }
             }
         }
+        if needs_credit {
+            self.put_with_credit(&mut rejected);
+        }
+        // 已拒收和待销毁对象的record保持reported，实际Drop后才标DEAD。
         drop(rejected);
     }
 
-    fn close(&self) -> Trimmed {
-        let (idle, removed) = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            self.closed.store(true, Ordering::Release);
-            state.closed = true;
-            let removed = Trimmed {
-                values: state.idle.len(),
-                bytes: state.bytes,
-            };
-            state.bytes = 0;
-            (mem::take(&mut state.idle), removed)
+    #[cold]
+    #[inline(never)]
+    fn put_with_credit(&self, rejected: &mut Option<Idle<T, C>>) {
+        let mut caches = Vec::with_capacity(8);
+        let mut states = Vec::with_capacity(8);
+        let operation = match self.policy.operations.try_lock() {
+            Ok(operation) => operation,
+            Err(_) => return,
         };
-        drop(idle);
-        removed
-    }
-
-    fn trim(&self) -> Trimmed {
-        if self.closed.load(Ordering::Acquire) {
-            return Trimmed::default();
+        if self.policy.closed.load(Ordering::Acquire) {
+            return;
         }
-        // 预留接收目录在锁外，后续Drop归还push不得引起锁内扩容。
-        let replacement = Vec::with_capacity(self.limits.max_cached_values);
-        let (idle, removed) = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.closed {
-                return Trimmed::default();
+        self.policy.cache_handles(&mut caches);
+        for cache in &caches {
+            match cache.state.try_lock() {
+                Ok(state) => states.push(state),
+                Err(_) => return,
             }
-            let removed = Trimmed {
-                values: state.idle.len(),
-                bytes: state.bytes,
-            };
-            state.bytes = 0;
-            (mem::replace(&mut state.idle, replacement), removed)
+        }
+        let bytes = rejected.as_ref().expect("pending return").bytes;
+        let total = match states[self.index].bytes.checked_add(bytes) {
+            Some(total) => total,
+            None => return,
         };
-        drop(idle);
-        removed
+        let count = states[self.index].idle.len() + 1;
+        let need_bytes = total.saturating_sub(states[self.index].credit_bytes);
+        let need_values = count.saturating_sub(states[self.index].credit_values);
+        let mut credits = self
+            .policy
+            .credits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let limits = self.policy.limits;
+        if need_bytes > limits.max_cached_bytes - credits.bytes
+            || need_values > limits.max_cached_values - credits.values
+        {
+            for (index, state) in states.iter_mut().enumerate() {
+                if index == self.index {
+                    continue;
+                }
+                let free_bytes = state.credit_bytes - state.bytes;
+                let free_values = state.credit_values - state.idle.len();
+                state.credit_bytes -= free_bytes;
+                state.credit_values -= free_values;
+                credits.bytes -= free_bytes;
+                credits.values -= free_values;
+            }
+        }
+        if need_bytes <= limits.max_cached_bytes - credits.bytes
+            && need_values <= limits.max_cached_values - credits.values
+        {
+            credits.bytes += need_bytes;
+            credits.values += need_values;
+            let state = &mut states[self.index];
+            state.credit_bytes += need_bytes;
+            state.credit_values += need_values;
+            state.store_idle(rejected.take().expect("owned idle reservation"), total);
+        }
+        drop(credits);
+        drop(states);
+        drop(operation);
     }
 }
 
 impl<T: Recyclable> ManagedPool<T> {
-    /// Creates a controller with the default backing-pool configuration.
+    /// Creates an optional retention policy on the default backing pool.
     pub fn new(limits: CacheLimits) -> Self {
         Self::new_with_config(limits)
     }
 
-    /// Creates a controller with a custom backing-pool configuration.
+    /// Creates a retention policy with a custom backing-pool configuration.
     pub fn new_with_config<C: cfg::Config>(limits: CacheLimits) -> ManagedPool<T, C> {
-        let idle = Vec::with_capacity(limits.max_cached_values);
-        ManagedPool {
-            slots: Arc::new(Pool::<Entry<T>>::new_with_config::<C>()),
-            cache: Arc::new(Cache {
-                limits,
-                state: Mutex::new(State {
-                    idle,
-                    bytes: 0,
-                    closed: false,
-                    hits: 0,
-                    misses: 0,
-                }),
-                closed: AtomicBool::new(false),
-                active: AtomicUsize::new(0),
+        let count = limits.max_cached_values.max(1).min(8).next_power_of_two();
+        let policy = Arc::new(Policy {
+            limits,
+            closed: AtomicBool::new(false),
+            operations: Mutex::new(()),
+            credits: Mutex::new(Credits {
+                bytes: 0,
+                values: 0,
+                donors: Vec::with_capacity(count),
             }),
+            records: Mutex::new(Vec::new()),
+        });
+        let caches: Vec<_> = (0..count)
+            .map(|index| {
+                Arc::new(Cache {
+                    index,
+                    policy: policy.clone(),
+                    state: Mutex::new(State {
+                        idle: Vec::with_capacity(limits.max_cached_values),
+                        bytes: 0,
+                        credit_bytes: 0,
+                        credit_values: 0,
+                        hits: 0,
+                        misses: 0,
+                    }),
+                    initializing: AtomicUsize::new(0),
+                })
+            })
+            .collect();
+        policy
+            .credits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .donors = caches.iter().map(Arc::downgrade).collect();
+        ManagedPool {
+            slots: Arc::new(Pool::<Entry<T, C>>::new_with_config::<C>()),
+            caches,
+            policy,
         }
     }
 }
 
 impl<T: Recyclable, C: cfg::Config> ManagedPool<T, C> {
-    /// Acquires an exclusive value or reports closure/backing-slot exhaustion.
+    /// Acquires a cleared value. Cached reserved slots can cross workers.
     ///
-    /// Admission linearizes under the controller lock. A request admitted
-    /// before close may finish its lazy `Default` and return afterward. Such a
-    /// lease remains valid but cannot cache payload on return. Defaults run
-    /// outside locks; their panics and allocation failures are not rejections.
+    /// A pre-close admission can finish lazy Default after close. Callbacks and
+    /// allocation failures are not converted into capacity/closed rejections.
+    #[inline(always)]
     pub fn try_lease_owned(&self) -> Result<ManagedLease<T, C>, ManagedAcquireError> {
-        if self.cache.closed.load(Ordering::Acquire) {
+        if self.policy.closed.load(Ordering::Acquire) {
             return Err(ManagedAcquireError::Closed);
         }
+        let index = crate::Tid::<C>::current().as_usize() & (self.caches.len() - 1);
+        self.lease_from_cache(&self.caches[index])
+    }
+
+    #[inline(always)]
+    fn lease_from_cache(
+        &self,
+        cache: &Arc<Cache<T, C>>,
+    ) -> Result<ManagedLease<T, C>, ManagedAcquireError> {
+        let index = cache.index;
+        let cached = cache.checkout()?;
+        let mut inner = if let Some(mut inner) = cached {
+            let permit = inner.permit.as_mut().expect("cached admission route");
+            if permit.index != index {
+                permit.cache = Arc::downgrade(cache);
+                permit.index = index;
+            }
+            debug_assert!(!permit.active);
+            permit.active = true;
+            inner
+        } else {
+            self.acquire_cold(cache)?
+        };
+        if inner.value.is_none() {
+            inner.value = Some(T::default());
+        }
+        Ok(ManagedLease { inner: Some(inner) })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn acquire_cold(
+        &self,
+        cache: &Arc<Cache<T, C>>,
+    ) -> Result<ReservedLease<T, C>, ManagedAcquireError> {
+        let permit = Permit {
+            cache: Arc::downgrade(cache),
+            index: cache.index,
+            active: true,
+            initializing: true,
+        };
         let mut inner = self
             .slots
             .clone()
             .lease_owned()
             .ok_or(ManagedAcquireError::Capacity)?;
-        let value = self.cache.checkout()?;
-        // Default panic时底层独占租约清理Entry，已安装的permit自动退回许可。
-        if let Some(ref mut permit) = inner.permit {
-            debug_assert!(!permit.active);
-            permit.active = true;
-        } else {
-            inner.permit = Some(Permit {
-                cache: Arc::downgrade(&self.cache),
-                active: true,
+        inner.permit = Some(permit);
+        if inner.record.is_none() {
+            let record = Arc::new(ReturnRecord {
+                phase: AtomicUsize::new(RECORD_ACTIVE),
+                bytes: AtomicUsize::new(0),
             });
+            {
+                let mut records = self
+                    .policy
+                    .records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                records.retain(|record| record.upgrade().is_some());
+                records.push(Arc::downgrade(&record));
+            }
+            inner.record = Some(record);
         }
-        inner.value = Some(value.unwrap_or_default());
-        Ok(ManagedLease { inner })
+        if let Some(ref record) = inner.record {
+            record.phase.store(RECORD_ACTIVE, Ordering::Release);
+        }
+        inner
+            .permit
+            .as_mut()
+            .expect("initializing permit")
+            .initializing = false;
+        cache.initializing.fetch_sub(1, Ordering::Relaxed);
+        Ok(Box::new(inner))
     }
 
-    /// Removes payloads idle at the trim linearization point, then drops them
-    /// outside locks. Racing returns may refill the cache. Active/shared values
-    /// and backing slab pages are not trimmed. Replacement metadata can allocate.
+    /// Removes exactly then-idle ownership at one all-shard snapshot. Racing
+    /// returns can refill afterward. Backing slab pages are not evicted.
     pub fn trim(&self) -> Trimmed {
-        self.cache.trim()
+        self.drain(false)
     }
 
-    /// Closes admission and drains then-current idle payloads outside locks.
-    /// Idempotent. Does not invalidate admitted or shared leases, wait for them,
-    /// or evict backing pages. Future returns are cleared and discarded.
+    /// Closes admission and drains idle ownership at one all-shard snapshot.
+    /// Does not wait for, clear or invalidate active/shared readers.
     pub fn close(&self) -> Trimmed {
-        self.cache.close()
+        self.drain(true)
     }
 
-    /// Reads cache accounting. This does not measure process memory.
-    pub fn stats(&self) -> CacheStats {
-        let state = self.cache.state.lock().unwrap_or_else(|e| e.into_inner());
-        CacheStats {
-            closed: state.closed,
-            cached_values: state.idle.len(),
-            cached_bytes: state.bytes,
-            cache_storage_bytes: state
-                .idle
-                .capacity()
-                .saturating_mul(mem::size_of::<Idle<T>>()),
-            active_leases: self.cache.active.load(Ordering::Relaxed),
-            cache_hits: state.hits,
-            cache_misses: state.misses,
+    fn drain(&self, close: bool) -> Trimmed {
+        if !close && self.policy.closed.load(Ordering::Acquire) {
+            return Trimmed::default();
         }
+        let mut replacements: Vec<_> = (0..self.caches.len())
+            .map(|_| {
+                if close {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(self.policy.limits.max_cached_values)
+                }
+            })
+            .collect();
+        let mut states = Vec::with_capacity(self.caches.len());
+        let mut drained = Vec::with_capacity(self.caches.len());
+        let mut removed = Trimmed::default();
+        {
+            let operation = self
+                .policy
+                .operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for cache in &self.caches {
+                states.push(cache.state.lock().unwrap_or_else(|e| e.into_inner()));
+            }
+            if close {
+                self.policy.closed.store(true, Ordering::Release);
+            } else if self.policy.closed.load(Ordering::Acquire) {
+                return Trimmed::default();
+            }
+            for (state, replacement) in states.iter_mut().zip(replacements.drain(..)) {
+                for idle in &state.idle {
+                    if let Some(ref record) = idle.lease.record {
+                        record.phase.store(RECORD_REPORTED, Ordering::Release);
+                    }
+                }
+                removed.values += state.idle.len();
+                removed.bytes += state.bytes;
+                drained.push(mem::replace(&mut state.idle, replacement));
+                state.bytes = 0;
+                state.credit_bytes = 0;
+                state.credit_values = 0;
+            }
+            let mut credits = self
+                .policy
+                .credits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            credits.bytes = 0;
+            credits.values = 0;
+            drop(credits);
+            states.clear();
+            drop(operation);
+        }
+        drop(drained);
+        removed
+    }
+
+    /// Observes all idle shards together, plus separately changing active/return
+    /// diagnostics. This is not a transactionally consistent heap measurement.
+    pub fn stats(&self) -> CacheStats {
+        let mut states = Vec::with_capacity(self.caches.len());
+        for cache in &self.caches {
+            states.push(cache.state.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+        let mut stats = CacheStats {
+            closed: self.policy.closed.load(Ordering::Acquire),
+            cached_values: 0,
+            cached_bytes: 0,
+            cache_storage_bytes: 0,
+            active_leases: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            reserved_cache_bytes: 0,
+            reserved_cache_values: 0,
+            returning_values: 0,
+            reported_returning_bytes: 0,
+            unreported_returning_values: 0,
+            reclaim_storage_bytes: self
+                .caches
+                .len()
+                .saturating_mul(mem::size_of::<Cache<T, C>>()),
+        };
+        for (state, cache) in states.iter().zip(&self.caches) {
+            stats.cached_values += state.idle.len();
+            stats.cached_bytes += state.bytes;
+            stats.cache_storage_bytes = stats.cache_storage_bytes.saturating_add(
+                state
+                    .idle
+                    .capacity()
+                    .saturating_mul(mem::size_of::<Idle<T, C>>()),
+            );
+            stats.reserved_cache_bytes += state.credit_bytes;
+            stats.reserved_cache_values += state.credit_values;
+            stats.active_leases = stats
+                .active_leases
+                .saturating_add(cache.initializing.load(Ordering::Relaxed));
+            stats.cache_hits = stats.cache_hits.saturating_add(state.hits);
+            stats.cache_misses = stats.cache_misses.saturating_add(state.misses);
+        }
+        states.clear();
+        let records = self
+            .policy
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        stats.reclaim_storage_bytes = stats.reclaim_storage_bytes.saturating_add(
+            records
+                .capacity()
+                .saturating_mul(mem::size_of::<Weak<ReturnRecord>>()),
+        );
+        for record in records.iter().filter_map(Weak::upgrade) {
+            stats.reclaim_storage_bytes = stats
+                .reclaim_storage_bytes
+                .saturating_add(mem::size_of::<ReturnRecord>());
+            let phase = record.phase.load(Ordering::Acquire);
+            if phase != RECORD_DEAD {
+                stats.reclaim_storage_bytes = stats
+                    .reclaim_storage_bytes
+                    .saturating_add(mem::size_of::<OwnedLease<Entry<T, C>, C>>());
+            }
+            if phase == RECORD_ACTIVE || phase == RECORD_CLEARING {
+                stats.active_leases = stats.active_leases.saturating_add(1);
+            }
+            if phase == RECORD_CLEARING || phase == RECORD_REPORTED {
+                stats.returning_values = stats.returning_values.saturating_add(1);
+                if phase == RECORD_CLEARING {
+                    stats.unreported_returning_values =
+                        stats.unreported_returning_values.saturating_add(1);
+                } else {
+                    stats.reported_returning_bytes = stats
+                        .reported_returning_bytes
+                        .saturating_add(record.bytes.load(Ordering::Relaxed));
+                }
+            }
+        }
+        stats
     }
 }
+
 impl<T: Recyclable, C: cfg::Config> Drop for ManagedPool<T, C> {
     fn drop(&mut self) {
-        self.cache.close();
+        self.close();
     }
 }
 
 impl<T: Recyclable, C: cfg::Config> ManagedLease<T, C> {
-    /// Consumes exclusive access. Last-reader clearing uses the managed policy.
-    /// The backing shared lease allocates one `Arc` control block.
+    /// Shares read-only ownership of the private exclusive reservation using
+    /// one Arc control block. No raw key is published or exposed.
     pub fn freeze(self) -> ManagedSharedLease<T, C> {
         ManagedSharedLease {
-            inner: self.inner.freeze(),
+            inner: crate::sync::Arc::new(self),
+        }
+    }
+}
+impl<T: Recyclable, C: cfg::Config> Drop for ManagedLease<T, C> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if let Some(mut inner) = self.inner.take() {
+            if let Some(mut value) = inner.value.take() {
+                if let Some(ref record) = inner.record {
+                    record.phase.store(RECORD_CLEARING, Ordering::Release);
+                }
+                value.clear();
+                if let Some(mut permit) = inner.permit.take() {
+                    if let Some(cache) = permit.cache.upgrade() {
+                        if !cache.policy.closed.load(Ordering::Acquire)
+                            && cache.policy.limits.max_cached_values != 0
+                        {
+                            let bytes = value.retained_bytes();
+                            if let Some(ref record) = inner.record {
+                                record.bytes.store(bytes, Ordering::Relaxed);
+                                record.phase.store(RECORD_REPORTED, Ordering::Release);
+                            }
+                            permit.release(&cache);
+                            inner.value = Some(value);
+                            inner.permit = Some(permit);
+                            cache.put_clean(inner, bytes);
+                            return;
+                        }
+                        permit.release(&cache);
+                    }
+                }
+            }
         }
     }
 }
 impl<T: Recyclable, C: cfg::Config> ops::Deref for ManagedLease<T, C> {
     type Target = T;
+    #[inline(always)]
     fn deref(&self) -> &T {
-        self.inner.value.as_ref().expect("managed lease value")
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.value.as_ref())
+            .expect("managed lease value")
     }
 }
 impl<T: Recyclable, C: cfg::Config> ops::DerefMut for ManagedLease<T, C> {
+    #[inline(always)]
     fn deref_mut(&mut self) -> &mut T {
-        self.inner.value.as_mut().expect("managed lease value")
+        self.inner
+            .as_mut()
+            .and_then(|inner| inner.value.as_mut())
+            .expect("managed lease value")
     }
 }
 impl<T: Recyclable, C: cfg::Config> ops::Deref for ManagedSharedLease<T, C> {
     type Target = T;
+    #[inline(always)]
     fn deref(&self) -> &T {
-        self.inner.value.as_ref().expect("managed shared value")
+        &self.inner
     }
 }
 impl<T: Recyclable, C: cfg::Config> Clone for ManagedSharedLease<T, C> {
@@ -441,14 +824,6 @@ impl<T: Recyclable, C: cfg::Config> Clone for ManagedSharedLease<T, C> {
         Self {
             inner: self.inner.clone(),
         }
-    }
-}
-impl<T: Recyclable, C: cfg::Config> fmt::Debug for ManagedPool<T, C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ManagedPool")
-            .field("limits", &self.cache.limits)
-            .field("stats", &self.stats())
-            .finish()
     }
 }
 impl<T: Recyclable + fmt::Debug, C: cfg::Config> fmt::Debug for ManagedLease<T, C> {
@@ -461,6 +836,14 @@ impl<T: Recyclable + fmt::Debug, C: cfg::Config> fmt::Debug for ManagedSharedLea
         f.debug_tuple("ManagedSharedLease").field(&&**self).finish()
     }
 }
+impl<T: Recyclable, C: cfg::Config> fmt::Debug for ManagedPool<T, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ManagedPool")
+            .field("limits", &self.policy.limits)
+            .field("stats", &self.stats())
+            .finish()
+    }
+}
 
 #[cfg(all(test, not(loom)))]
 mod tests {
@@ -468,16 +851,20 @@ mod tests {
 
     #[derive(Default)]
     struct Probe {
-        cache: Weak<Cache<Probe>>,
+        pool: Weak<ManagedPool<Probe>>,
         observed: Option<Arc<AtomicUsize>>,
     }
     impl Probe {
         fn check_unlocked(&self, bit: usize) {
-            if let (Some(cache), Some(ref observed)) = (self.cache.upgrade(), &self.observed) {
-                assert!(
-                    cache.state.try_lock().is_ok(),
-                    "payload callback ran with cache locked"
-                );
+            if let (Some(pool), Some(ref observed)) = (self.pool.upgrade(), &self.observed) {
+                for cache in &pool.caches {
+                    assert!(cache.state.try_lock().is_ok());
+                }
+                assert!(pool.policy.credits.try_lock().is_ok());
+                assert!(pool.policy.operations.try_lock().is_ok());
+                assert!(pool.policy.records.try_lock().is_ok());
+                let stats = pool.stats();
+                assert!(stats.returning_values >= 1);
                 observed.fetch_or(bit, Ordering::SeqCst);
             }
         }
@@ -496,16 +883,20 @@ mod tests {
     impl Drop for Probe {
         fn drop(&mut self) {
             self.check_unlocked(4);
+            if let Some(pool) = self.pool.upgrade() {
+                pool.close();
+                pool.trim();
+            }
         }
     }
 
     #[test]
-    fn all_payload_callbacks_run_outside_cache_lock() {
+    fn payload_callbacks_reenter_stats_and_close_outside_all_policy_locks() {
         for close in [false, true].iter().copied() {
-            let pool = ManagedPool::<Probe>::new(CacheLimits::new(0, 2));
+            let pool = Arc::new(ManagedPool::<Probe>::new(CacheLimits::new(0, 2)));
             let observed = Arc::new(AtomicUsize::new(0));
             let mut value = pool.try_lease_owned().unwrap();
-            value.cache = Arc::downgrade(&pool.cache);
+            value.pool = Arc::downgrade(&pool);
             value.observed = Some(observed.clone());
             drop(value);
             assert_eq!(observed.load(Ordering::SeqCst), 3);
@@ -519,37 +910,68 @@ mod tests {
     }
 
     #[test]
-    fn contended_return_discards_without_waiting_for_cache_lock() {
+    fn contended_return_discards_without_waiting_for_return_shard() {
         let pool = ManagedPool::<Vec<u8>>::new(CacheLimits::new(1024, 2));
         let mut value = pool.try_lease_owned().unwrap();
         value.resize(128, 0);
-        let state = pool.cache.state.lock().unwrap();
+        let index = value.inner.as_ref().unwrap().permit.as_ref().unwrap().index;
+        let state = pool.caches[index].state.lock().unwrap();
         drop(value);
-        assert_eq!(pool.cache.active.load(Ordering::Relaxed), 0);
         assert!(state.idle.is_empty());
         drop(state);
-        assert_eq!(pool.stats().cached_bytes, 0);
+        let stats = pool.stats();
+        assert_eq!(stats.active_leases, 0);
+        assert_eq!(stats.returning_values, 0);
     }
 
     #[test]
-    fn abandoned_inactive_slot_does_not_release_another_admission() {
+    fn unpublished_cached_reservation_does_not_retire_another_admission() {
         let pool = ManagedPool::<Vec<u8>>::new(CacheLimits::new(1024, 2));
-        drop(pool.try_lease_owned().unwrap());
-        // 模拟槽已取得但随后close拒绝准入；旧失活路由不能扣别人的许可。
-        let abandoned = pool.slots.clone().lease_owned().unwrap();
-        let mut survivor = pool.try_lease_owned().unwrap();
+        drop(pool.lease_from_cache(&pool.caches[0]).unwrap());
+        let abandoned = pool.caches[0].checkout().unwrap().unwrap();
+        let mut survivor = pool.lease_from_cache(&pool.caches[0]).unwrap();
         survivor.push(73);
         pool.close();
-        assert_eq!(
-            pool.cache.checkout().err(),
-            Some(ManagedAcquireError::Closed)
-        );
         drop(abandoned);
         assert_eq!(pool.stats().active_leases, 1);
-        let cache = Arc::downgrade(&pool.cache);
+        let cache = Arc::downgrade(&pool.caches[0]);
         drop(pool);
         assert!(cache.upgrade().is_none());
         assert_eq!(&**survivor, &[73]);
         std::thread::spawn(move || drop(survivor)).join().unwrap();
+    }
+
+    #[test]
+    fn cached_reservations_and_unused_credit_can_move_between_return_shards() {
+        let pool = ManagedPool::<Vec<u8>>::new(CacheLimits::new(512, 4));
+        let mut values = Vec::new();
+        let mut pointers = Vec::new();
+        for _ in 0..4 {
+            let mut value = pool.lease_from_cache(&pool.caches[0]).unwrap();
+            value.resize(128, 7);
+            pointers.push(value.as_ptr());
+            values.push(value);
+        }
+        drop(values);
+        let value = pool.lease_from_cache(&pool.caches[1]).unwrap();
+        assert!(pointers.contains(&value.as_ptr()));
+        assert_eq!(pool.stats().cache_misses, 4);
+        drop(value);
+        let stats = pool.stats();
+        assert_eq!(stats.cached_values, 4);
+        assert_eq!(stats.cached_bytes, 512);
+        assert_eq!(stats.reserved_cache_values, 4);
+        assert_eq!(stats.reserved_cache_bytes, 512);
+        assert_eq!(pool.caches[0].state.lock().unwrap().credit_values, 3);
+        assert_eq!(pool.caches[1].state.lock().unwrap().credit_values, 1);
+        assert_eq!(
+            pool.trim(),
+            Trimmed {
+                values: 4,
+                bytes: 512
+            }
+        );
+        assert_eq!(pool.stats().reserved_cache_values, 0);
+        assert_eq!(pool.stats().reserved_cache_bytes, 0);
     }
 }

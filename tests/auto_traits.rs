@@ -54,6 +54,10 @@ assert_not_impl!(pool::ManagedPool<Reported<ThreadBound>>: Sync);
 assert_not_impl!(pool::ManagedLease<Reported<ThreadBound>>: Send);
 assert_not_impl!(pool::ManagedSharedLease<Reported<ThreadBound>>: Send);
 assert_not_impl!(pool::ManagedSharedLease<Reported<ThreadBound>>: Sync);
+assert_not_impl!(pool::ManagedPool<Reported<SendOnly>>: Sync);
+assert_not_impl!(pool::ManagedLease<Reported<SendOnly>>: Send);
+assert_not_impl!(pool::ManagedSharedLease<Reported<SendOnly>>: Send);
+assert_not_impl!(pool::ManagedSharedLease<Reported<SendOnly>>: Sync);
 
 #[test]
 fn supported_auto_traits() {
