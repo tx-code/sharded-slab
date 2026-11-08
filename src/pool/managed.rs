@@ -687,7 +687,13 @@ impl<T: Recyclable, C: cfg::Config> ManagedPool<T, C> {
             reclaim_storage_bytes: self
                 .caches
                 .len()
-                .saturating_mul(mem::size_of::<Cache<T, C>>()),
+                .saturating_mul(mem::size_of::<Cache<T, C>>())
+                .saturating_add(mem::size_of::<Policy<T, C>>())
+                .saturating_add(
+                    self.caches
+                        .capacity()
+                        .saturating_mul(mem::size_of::<Arc<Cache<T, C>>>()),
+                ),
         };
         for (state, cache) in states.iter().zip(&self.caches) {
             stats.cached_values += state.idle.len();
@@ -707,6 +713,19 @@ impl<T: Recyclable, C: cfg::Config> ManagedPool<T, C> {
             stats.cache_misses = stats.cache_misses.saturating_add(state.misses);
         }
         states.clear();
+        {
+            let credits = self
+                .policy
+                .credits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            stats.reclaim_storage_bytes = stats.reclaim_storage_bytes.saturating_add(
+                credits
+                    .donors
+                    .capacity()
+                    .saturating_mul(mem::size_of::<Weak<Cache<T, C>>>()),
+            );
+        }
         let records = self
             .policy
             .records
